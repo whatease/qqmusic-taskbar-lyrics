@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import threading
 import time
 import urllib.error
@@ -36,8 +37,49 @@ log = logging.getLogger("mimo")
 BASE = "https://platform.xiaomimimo.com"
 PROFILE_DIR = app_config.ROOT / ".mimo_profile"      # playwright 持久化 profile
 STATE_PATH = app_config.ROOT / "mimo_session.json"   # cookie 快照(纯 HTTP 取数用)
+BUSY_PATH = PROFILE_DIR / ".busy"                    # profile 排他锁(防并发 Chromium)
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
+
+
+def _acquire_profile(wait_sec: float = 0.0) -> bool:
+    """排他占用 .mimo_profile。
+
+    同一 profile 同时开两个 Chromium(如登录窗口 + 后台续期)会被
+    Singleton 机制互杀,表现为登录窗口莫名"TargetClosed"。锁 30 分钟
+    未释放视为陈旧(进程崩溃残留)自动清除。
+    """
+    PROFILE_DIR.mkdir(exist_ok=True)
+    deadline = time.monotonic() + wait_sec
+    while True:
+        try:
+            fd = os.open(BUSY_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode("ascii"))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                stale = (time.time() - BUSY_PATH.stat().st_mtime) > 1800
+            except OSError:
+                stale = True
+            if stale:
+                try:
+                    BUSY_PATH.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.3)
+
+
+def _release_profile() -> None:
+    try:
+        BUSY_PATH.unlink()
+    except OSError:
+        pass
 
 
 class SessionExpired(Exception):
@@ -177,67 +219,78 @@ def _has_platform_session(page, timeout_ms: int) -> bool:
 
 def renew(timeout_ms: int = 25000) -> bool:
     """无头走一遍 genLoginUrl SSO 链续期。成功返回 True;账号会话失效返回 False。"""
-    PROFILE_DIR.mkdir(exist_ok=True)
-    with _pw() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            str(PROFILE_DIR), headless=True, viewport={"width": 960, "height": 640})
-        try:
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            page.goto(f"{BASE}/api/v1/genLoginUrl"
-                      f"?currentPath={urllib.parse.quote('/console/balance')}",
-                      wait_until="domcontentloaded", timeout=timeout_ms)
-            # 正常链:302 → account.xiaomimimo.com(会话在,静默) → /sts → 控制台
-            ok = _has_platform_session(page, timeout_ms)
-            if ok:
-                _save_state(ctx.storage_state())
-                log.info("MiMo 会话 SSO 续期成功")
-            else:
-                log.warning("MiMo SSO 续期未拿到会话,当前: %s", page.url[:120])
-            return ok
-        finally:
-            ctx.close()
+    if not _acquire_profile(wait_sec=0.0):
+        log.info("浏览器 profile 正被登录窗口占用,跳过本轮续期")
+        return False
+    try:
+        with _pw() as pw:
+            ctx = pw.chromium.launch_persistent_context(
+                str(PROFILE_DIR), headless=True,
+                viewport={"width": 960, "height": 640})
+            try:
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                page.goto(f"{BASE}/api/v1/genLoginUrl"
+                          f"?currentPath={urllib.parse.quote('/console/balance')}",
+                          wait_until="domcontentloaded", timeout=timeout_ms)
+                # 正常链:302 → account.xiaomimimo.com(会话在,静默) → /sts → 控制台
+                ok = _has_platform_session(page, timeout_ms)
+                if ok:
+                    _save_state(ctx.storage_state())
+                    log.info("MiMo 会话 SSO 续期成功")
+                else:
+                    log.warning("MiMo SSO 续期未拿到会话,当前: %s", page.url[:120])
+                return ok
+            finally:
+                ctx.close()
+    finally:
+        _release_profile()
 
 
 def login_interactive(timeout_sec: int = 300) -> bool:
     """有头浏览器让用户登录一次(托盘菜单触发);成功后保存会话快照。"""
-    PROFILE_DIR.mkdir(exist_ok=True)
-    with _pw() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            str(PROFILE_DIR), headless=False,
-            viewport={"width": 960, "height": 720},
-            args=["--window-position=120,120"])
-        try:
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    if not _acquire_profile(wait_sec=45.0):
+        log.warning("浏览器 profile 被占用,登录窗口暂不可用")
+        return False
+    try:
+        with _pw() as pw:
+            ctx = pw.chromium.launch_persistent_context(
+                str(PROFILE_DIR), headless=False,
+                viewport={"width": 960, "height": 720},
+                args=["--window-position=120,120"])
             try:
-                page.goto(BASE + "/console/balance", wait_until="domcontentloaded",
-                          timeout=30000)
-            except Exception:
-                pass
-            log.info("等待 MiMo 登录(最多 %ds)...", timeout_sec)
-            deadline = time.monotonic() + timeout_sec
-            while time.monotonic() < deadline:
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 try:
-                    cookie, _ = _cookie_header(ctx.storage_state())
-                    if cookie and "api-platform_ph=" in cookie:
-                        # 再确认真能取到数据(光有 cookie 不够)
-                        _save_state(ctx.storage_state())
-                        try:
-                            fetch()
-                            _save_state(ctx.storage_state())
-                            log.info("MiMo 登录成功并验证取数通过")
-                            return True
-                        except SessionExpired:
-                            STATE_PATH.unlink(missing_ok=True)
+                    page.goto(BASE + "/console/balance", wait_until="domcontentloaded",
+                              timeout=30000)
                 except Exception:
                     pass
-                page.wait_for_timeout(800)
-            log.warning("MiMo 登录超时")
-            return False
-        finally:
-            try:
-                ctx.close()
-            except Exception:
-                pass
+                log.info("等待 MiMo 登录(最多 %ds)...", timeout_sec)
+                deadline = time.monotonic() + timeout_sec
+                while time.monotonic() < deadline:
+                    try:
+                        cookie, _ = _cookie_header(ctx.storage_state())
+                        if cookie and "api-platform_ph=" in cookie:
+                            # 再确认真能取到数据(光有 cookie 不够)
+                            _save_state(ctx.storage_state())
+                            try:
+                                fetch()
+                                _save_state(ctx.storage_state())
+                                log.info("MiMo 登录成功并验证取数通过")
+                                return True
+                            except SessionExpired:
+                                STATE_PATH.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(800)
+                log.warning("MiMo 登录超时")
+                return False
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+    finally:
+        _release_profile()
 
 
 # ══════════════════════════ 后台线程 ══════════════════════════
@@ -256,6 +309,7 @@ class MimoWorker(threading.Thread):
         self.data: dict | None = None
         self.message = ""
         self.version = 0            # 每次更新 +1,UI 侧据此判断重绘
+        self._next_renew = 0.0      # 续期节流:失败后 15min 内不重试
         self._login_req = threading.Event()
         self._stop = threading.Event()
 
@@ -288,8 +342,12 @@ class MimoWorker(threading.Thread):
                 continue
             interval = self._cycle(first)
             first = False
-            # 登录请求可打断等待
-            self._stop.wait(interval)
+            # 登录请求可打断等待(切片等待,托盘点了立即响应)
+            end = time.monotonic() + interval
+            while time.monotonic() < end:
+                if self._stop.is_set() or self._login_req.is_set():
+                    break
+                self._stop.wait(0.2)
 
     def _cycle(self, first: bool) -> float:
         try:
@@ -300,18 +358,22 @@ class MimoWorker(threading.Thread):
             self._set("ok")
             return self.refresh_sec
         except SessionExpired as exc:
-            log.info("会话过期(%s),尝试 SSO 续期", exc)
-            self._set("fetching", "会话续期中...")
-            try:
-                if renew():
-                    data = fetch()
-                    self.data = data
-                    self._set("ok")
-                    return self.refresh_sec
-            except SessionExpired:
-                pass
-            except Exception as exc2:
-                log.warning("SSO 续期异常: %s", exc2)
+            # 续期节流:失败后 15min 内不再拉起 Chromium —— 否则每分钟
+            # 一次的无头续期既拖慢机器,又会和登录窗口抢同一 profile
+            if time.monotonic() >= self._next_renew:
+                self._next_renew = time.monotonic() + 900.0
+                log.info("会话过期(%s),尝试 SSO 续期", exc)
+                self._set("fetching", "会话续期中...")
+                try:
+                    if renew():
+                        data = fetch()
+                        self.data = data
+                        self._set("ok")
+                        return self.refresh_sec
+                except SessionExpired:
+                    pass
+                except Exception as exc2:
+                    log.warning("SSO 续期异常: %s", exc2)
             self._set("need_login", "小米账号会话已过期")
             return 60.0
         except Exception as exc:
@@ -322,7 +384,8 @@ class MimoWorker(threading.Thread):
     def _do_login(self) -> None:
         self._set("fetching", "请在打开的浏览器中登录小米账号")
         try:
-            if login_interactive():
+            if login_interactive(timeout_sec=600):
+                self._next_renew = 0.0        # 登录成功后续期恢复正常节奏
                 data = fetch()
                 self.data = data
                 self._set("ok")

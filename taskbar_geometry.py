@@ -249,8 +249,12 @@ class GeometryPoller(threading.Thread):
     UIA 枚举在任务栏布局变化(开/关应用)瞬间可能被阻塞数秒并返回
     不一致快照 —— 这是歌词条左右抖动的根源。因此:
       1. 测量放进独立 worker 线程(single-flight,慢测量不阻塞轮询);
-      2. 耗时超过 1.2s 的快照直接丢弃(视为任务栏忙碌期的脏数据);
-      3. 应用侧再做双确认去抖 + 死区 + 平滑滑动。
+      2. 快照一律交付,去抖完全交给应用侧(双确认 + 死区 + 平滑滑动):
+         不一致的快照几乎不会连续两轮完全相同,自然被双确认挡掉。
+         曾按"耗时>1.2s 丢弃"过滤,但机器负载高时 UIA 遍历常态就要
+         2s+,等于把所有更新都丢光 → 歌词条永远卡着不动(实测复现);
+      3. worker 卡死(跨进程 UIA 调用挂起)超 15s 则放弃本轮重建,
+         避免 single-flight 永久堵死同样造成"不再动"。
     """
 
     def __init__(self, hwnd: int, config, on_change, on_config_change):
@@ -261,6 +265,8 @@ class GeometryPoller(threading.Thread):
         self.on_config_change = on_config_change
         self._worker: threading.Thread | None = None
         self._worker_result = (None, 0.0)
+        self._worker_t0 = 0.0
+        self._gen = 0                     # 结果世代号:被放弃的 worker 结果作废
         self._stop = threading.Event()
 
     def run(self) -> None:
@@ -274,27 +280,35 @@ class GeometryPoller(threading.Thread):
                 if w is not None and not w.is_alive():
                     geo, took = self._worker_result
                     self._worker = None
-                    if took <= 1.2:
-                        self.on_change(geo)
-                        if self.config.changed_on_disk():
-                            if self.config.reload():
-                                self.on_config_change()
-                    else:
-                        log.debug("丢弃忙碌期 UIA 快照(耗时 %.1fs)", took)
+                    if took > 1.2:
+                        log.debug("慢速 UIA 快照(耗时 %.1fs),交由应用侧双确认去抖",
+                                  took)
+                    self.on_change(geo)
+                    if self.config.changed_on_disk():
+                        if self.config.reload():
+                            self.on_config_change()
+                if (self._worker is not None
+                        and time.monotonic() - self._worker_t0 > 15.0):
+                    log.warning("UIA 探测超时(>15s),放弃本轮重建探测")
+                    self._gen += 1        # 泄漏线程的结果回来后作废
+                    self._worker = None
                 if self._worker is None:
                     self._worker = threading.Thread(
                         target=self._probe, daemon=True)
+                    self._worker_t0 = time.monotonic()
                     self._worker.start()
             except Exception as exc:
                 log.exception("几何轮询异常: %s", exc)
 
     def _probe(self) -> None:
+        gen = self._gen
         t0 = time.monotonic()
         try:
             geo = get_geometry(self.config.get("min_gap_width", 150.0))
         except Exception:
             geo = Geometry()
-        self._worker_result = (geo, time.monotonic() - t0)
+        if gen == self._gen:              # 未被放弃才交付
+            self._worker_result = (geo, time.monotonic() - t0)
 
     def stop(self) -> None:
         self._stop.set()
