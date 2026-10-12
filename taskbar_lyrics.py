@@ -38,6 +38,8 @@ from app_config import Config
 from karaoke_renderer import KaraokeRenderer
 from lyrics_client import LyricsClient
 from media_watcher import MediaWatcher
+from mimo_client import MimoWorker
+from mimo_widget import MimoRenderer
 
 APP_NAME = "QQ音乐底栏歌词"
 CLASS_NAME = "QQMusicTaskbarLyricsWnd"
@@ -48,6 +50,7 @@ WM_APP_GEOM = 0x8000 + 1
 WM_APP_LYRICS = 0x8000 + 2
 WM_APP_TRAY = 0x8000 + 4
 WM_APP_CMD = 0x8000 + 5
+WM_APP_MIMO = 0x8000 + 6
 
 try:
     TASKBAR_CREATED_MSG = win32gui.RegisterWindowMessage("TaskbarCreated")
@@ -109,10 +112,12 @@ class TrayIcon:
     MENU_TOGGLE = 1
     MENU_AUTOSTART = 2
     MENU_QUIT = 3
+    MENU_MIMO = 4
 
-    def __init__(self, hwnd: int, on_toggle, on_autostart, on_quit):
+    def __init__(self, hwnd: int, on_toggle, on_autostart, on_quit, on_mimo=None):
         self.hwnd = hwnd
         self.on_toggle, self.on_autostart, self.on_quit = on_toggle, on_autostart, on_quit
+        self.on_mimo = on_mimo
         self.hicon = _pil_to_hicon(_make_tray_icon_image(32))
         self.added = False
         self.add()                     # 失败不抛异常:开机时任务栏可能未就绪
@@ -138,6 +143,9 @@ class TrayIcon:
         auto_on = get_autostart()
         flags = win32con.MF_STRING | (win32con.MF_CHECKED if auto_on else 0)
         win32gui.AppendMenu(menu, flags, self.MENU_AUTOSTART, "开机自启")
+        if self.on_mimo is not None:
+            win32gui.AppendMenu(menu, win32con.MF_STRING, self.MENU_MIMO,
+                                "登录 MiMo 账号(余额挂件)")
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
         win32gui.AppendMenu(menu, win32con.MF_STRING, self.MENU_QUIT, "退出")
         win32gui.SetForegroundWindow(self.hwnd)
@@ -154,6 +162,8 @@ class TrayIcon:
             self.on_autostart()
         elif cmd == self.MENU_QUIT:
             self.on_quit()
+        elif cmd == self.MENU_MIMO and self.on_mimo:
+            self.on_mimo()
 
     def remove(self) -> None:
         try:
@@ -321,6 +331,14 @@ class App:
         self._fs_cand_n = 0
         self._child_of_taskbar = False
         self.lyrics_worker = None
+        # MiMo 余额挂件(独立子窗口,贴托盘)
+        self.mimo_worker: MimoWorker | None = None
+        self.mimo_hwnd = None
+        self.mimo_layered = None
+        self.mimo_renderer = MimoRenderer()
+        self.mimo_visible = False
+        self._mimo_target = None       # 屏幕坐标 rect(几何线程/on_geometry 写)
+        self._mimo_drawn = -1          # 已绘制的 worker.version
 
     # ── 窗口过程 ────────────────────────────────────────
     def wnd_proc(self, hwnd, msg, wparam, lparam):
@@ -330,6 +348,8 @@ class App:
             self.on_geometry()
         elif msg == WM_APP_LYRICS:
             self.tick()  # 歌词到达,立即刷新
+        elif msg == WM_APP_MIMO:
+            self.tick()  # MiMo 数据更新,立即刷新
         elif msg == WM_APP_TRAY:
             if lparam == win32con.WM_RBUTTONUP or lparam == win32con.WM_CONTEXTMENU:
                 self.tray.show_menu()
@@ -378,18 +398,27 @@ class App:
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
     def ensure_parent(self) -> None:
-        """确保歌词窗口始终挂载在当前任务栏下(explorer重启自愈核心)。
+        """确保歌词/挂件窗口始终挂载在当前任务栏下(explorer重启自愈核心)。
 
         挂载关系失效(旧任务栏销毁)时重挂,并把屏幕坐标换算成
         任务栏客户区坐标重新落位。"""
-        if self.hwnd is None or not win32gui.IsWindow(self.hwnd):
+        self._ensure_child(self.hwnd, main=True)
+        self._ensure_child(self.mimo_hwnd, main=False)
+
+    def _ensure_child(self, hwnd: int | None, main: bool) -> None:
+        if hwnd is None or not win32gui.IsWindow(hwnd):
             return
-        if self._is_mounted_on_taskbar():
-            self._child_of_taskbar = True
+        if self._is_mounted_on_taskbar(hwnd):
+            if main:
+                self._child_of_taskbar = True
             return
-        self._adopt_taskbar_parent()
-        if self._child_of_taskbar:
-            self._apply_rect()      # 坐标系变化,需要重新落位
+        self._adopt_taskbar_parent(hwnd)
+        mounted = self._is_mounted_on_taskbar(hwnd)
+        if mounted:
+            if main:
+                self._apply_rect()      # 坐标系变化,需要重新落位
+            else:
+                self._apply_mimo_rect()
 
     # ── 窗口创建/自愈 ────────────────────────────────────
     def _create_main_window(self) -> None:
@@ -411,14 +440,34 @@ class App:
         self.layered = LayeredWindow(self.hwnd)
         # 注意:SetParent 必须等首次几何探测之后再做(见 run() 注释)
 
-    def _is_mounted_on_taskbar(self) -> bool:
-        """可靠地判断歌词窗口是否挂在任务栏下。
+    def _create_mimo_window(self) -> None:
+        """MiMo 余额挂件窗口:与歌词条同 class(几何探测自动排除),独立 hwnd。"""
+        wc = win32gui.WNDCLASS()
+        wc.lpszClassName = CLASS_NAME
+        wc.lpfnWndProc = self.wnd_proc
+        wc.hInstance = win32gui.GetModuleHandle(None)
+        wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+        try:
+            win32gui.RegisterClass(wc)
+        except Exception:
+            pass
+        exstyle = (win32con.WS_EX_LAYERED | win32con.WS_EX_TOPMOST |
+                   win32con.WS_EX_TOOLWINDOW | win32con.WS_EX_NOACTIVATE |
+                   win32con.WS_EX_TRANSPARENT)
+        self.mimo_hwnd = win32gui.CreateWindowEx(
+            exstyle, CLASS_NAME, "MiMo余额", win32con.WS_POPUP,
+            0, 0, 10, 10, 0, 0, wc.hInstance, None)
+        self.mimo_layered = LayeredWindow(self.mimo_hwnd)
+
+    def _is_mounted_on_taskbar(self, hwnd: int | None = None) -> bool:
+        """可靠地判断窗口是否挂在任务栏下。
 
         不能用 GetParent —— 对本窗口(WS_POPUP)它返回 owner 而非父;
         SetParent 的返回值也不行(成功时返回旧父,顶层窗口的旧父是桌面)。
         用 GetAncestor(GA_PARENT): 顶层窗口返回桌面句柄,挂载后返回任务栏。
         """
-        if not self.hwnd or not win32gui.IsWindow(self.hwnd):
+        hwnd = hwnd or self.hwnd
+        if not hwnd or not win32gui.IsWindow(hwnd):
             return False
         tray = taskbar_geometry.find_taskbar_hwnd()
         if not tray:
@@ -426,31 +475,36 @@ class App:
         _user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
         _user32.GetAncestor.restype = wt.HWND
         try:
-            return _user32.GetAncestor(self.hwnd, 1) == tray   # GA_PARENT
+            return _user32.GetAncestor(hwnd, 1) == tray   # GA_PARENT
         except Exception:
             return False
 
-    def _adopt_taskbar_parent(self) -> None:
+    def _adopt_taskbar_parent(self, hwnd: int | None = None) -> None:
         """挂为任务栏子窗口:子窗口永远绘制在任务栏表面之上,
         彻底避开"开始菜单/窗口切换时任务栏被系统提升、盖住歌词条"的Z序竞争
         (实测按Win键后任务栏会插到浮层歌词条之上且抢占周期性置顶)。"""
+        hwnd = hwnd or self.hwnd
+        is_main = hwnd == self.hwnd
         try:
             tray = taskbar_geometry.find_taskbar_hwnd()
             if not tray:
-                self._child_of_taskbar = False
+                if is_main:
+                    self._child_of_taskbar = False
                 return
             _user32.SetParent.argtypes = [wt.HWND, wt.HWND]
             _user32.SetParent.restype = wt.HWND
-            _user32.SetParent(self.hwnd, tray)
-            if self._is_mounted_on_taskbar():
-                if not self._child_of_taskbar:
+            _user32.SetParent(hwnd, tray)
+            if self._is_mounted_on_taskbar(hwnd):
+                if is_main and not self._child_of_taskbar:
                     log.info("已挂载为任务栏子窗口")
-                self._child_of_taskbar = True
-            else:
+                if is_main:
+                    self._child_of_taskbar = True
+            elif is_main:
                 self._child_of_taskbar = False
                 log.warning("任务栏子窗口挂载未生效,回退浮顶层")
         except Exception as exc:
-            self._child_of_taskbar = False
+            if is_main:
+                self._child_of_taskbar = False
             log.warning("挂载任务栏子窗口失败,回退浮顶层: %s", exc)
 
     def _recover_window(self) -> None:
@@ -469,6 +523,7 @@ class App:
         self.hwnd = None
         self.visible = False                  # 否则 set_visible(True) 会被短路
         self._create_main_window()
+        self._recover_mimo_window()
         if self.tray:
             self.tray.readd()
         self._adopt_taskbar_parent()
@@ -478,11 +533,67 @@ class App:
             self._apply_rect()
             self.set_visible(True)
 
+    def _recover_mimo_window(self) -> None:
+        """挂件窗口随任务栏一起被销毁时单独重建(可能先于主窗口丢失被发现)。"""
+        if self.mimo_hwnd is not None and win32gui.IsWindow(self.mimo_hwnd):
+            return
+        try:
+            if self.mimo_layered:
+                self.mimo_layered.close()
+        except Exception:
+            pass
+        self.mimo_layered = None
+        self.mimo_hwnd = None
+        self.mimo_visible = False
+        self._create_mimo_window()
+        self._adopt_taskbar_parent(self.mimo_hwnd)
+        if self._mimo_target:
+            self._apply_mimo_rect()
+            self._set_mimo_visible(True)
+
     # ── 几何变化(去抖 + 平滑) ───────────────────────────
+    def _split_gap(self, geo):
+        """把"图标↔托盘"空隙分成 (歌词条rect, 挂件rect)。
+
+        挂件贴托盘(空隙右端);空间不足时挂件收窄,窄到放不下
+        (逻辑 <110px)就整体让位给歌词条 —— 歌词是核心功能。
+        """
+        if geo is None or not geo.ok:
+            return None, None
+        l, t, r, b = geo.bar
+        gl, gr = geo.gap
+        gap_w = gr - gl
+        mw = 0
+        if self.cfg.get("mimo_widget", True):
+            wanted = int(self.cfg.get("mimo_width", 160) * geo.scale)
+            mw = min(wanted, gap_w - 102)     # 至少给歌词留 96 + 6 间隔
+            if mw < 110:
+                mw = 0
+        widget = (gr - mw, t, mw, b - t) if mw else None
+        lyric_w = gap_w - mw - (6 if mw else 0)
+        lyric = (gl, t, lyric_w, b - t) if lyric_w >= 96 else None
+        return lyric, widget
+
     def on_geometry(self) -> None:
         geo = self.geom
         now = time.monotonic()
-        if geo is None or not geo.ok:
+        geo_ok = geo is not None and geo.ok
+
+        if geo_ok:
+            lyric_rect, widget_rect = self._split_gap(geo)
+            # 挂件位置贴托盘、极少变化:直接落位,不参与滑动去抖
+            if widget_rect != self._mimo_target:
+                self._mimo_target = widget_rect
+                self._apply_mimo_rect()
+        else:
+            lyric_rect = None
+            # 瞬时探测失败:挂件与歌词一样保持原地,持续>10s才隐藏
+            if (self._last_geo_ok and now - self._last_geo_ok > 10.0
+                    and self._mimo_target is not None):
+                self._mimo_target = None
+                self._apply_mimo_rect()
+
+        if not geo_ok:
             # 短暂探测失败:歌词条保持原地;持续失败超10s才隐藏
             if self._last_geo_ok and now - self._last_geo_ok > 10.0:
                 self._target_rect = None
@@ -491,8 +602,11 @@ class App:
         self._last_geo_ok = now
         if geo.stale and self._target_rect is not None:
             return  # 近似估计:已有真实几何时不回退
-        rect = (geo.gap[0], geo.bar[1],
-                geo.gap[1] - geo.gap[0], geo.height)
+        rect = lyric_rect
+        if rect is None:
+            self._target_rect = None
+            self.set_visible(False)
+            return
 
         if self._target_rect is None:                 # 首次:直接落位
             self._target_rect = rect
@@ -524,6 +638,33 @@ class App:
         win32gui.SetWindowPos(self.hwnd, z, x, y, w, h,
                               win32con.SWP_NOACTIVATE)
         self.renderer.set_size(w, h)
+
+    def _apply_mimo_rect(self) -> None:
+        """落位挂件窗口;目标为空(空间不足/几何持续失败)则隐藏。"""
+        if self.mimo_hwnd is None or not win32gui.IsWindow(self.mimo_hwnd):
+            return
+        if self._mimo_target is None:
+            self._set_mimo_visible(False)
+            return
+        x, y, w, h = self._mimo_target
+        mounted = self._is_mounted_on_taskbar(self.mimo_hwnd)
+        if mounted and self.geom is not None:
+            x -= self.geom.bar[0]               # 子窗口坐标相对任务栏客户区
+            y -= self.geom.bar[1]
+        z = win32con.HWND_TOP if mounted else win32con.HWND_TOPMOST
+        win32gui.SetWindowPos(self.mimo_hwnd, z, x, y, w, h,
+                              win32con.SWP_NOACTIVATE)
+        self.mimo_renderer.set_size(w, h)
+        self._mimo_drawn = -1                   # 尺寸变化,强制重绘
+
+    def _set_mimo_visible(self, show: bool) -> None:
+        if self.mimo_hwnd is None or show == self.mimo_visible:
+            return
+        win32gui.ShowWindow(self.mimo_hwnd,
+                            win32con.SW_SHOWNOACTIVATE if show else win32con.SW_HIDE)
+        self.mimo_visible = show
+        if show:
+            self._mimo_drawn = -1
 
     def _animate_rect(self, dt: float) -> None:
         """当前矩形向目标矩形平滑滑动(约150ms收敛)。"""
@@ -562,11 +703,19 @@ class App:
             self._last_topmost = now
             if self.tray and not self.tray.added:
                 self.tray.add()
+            self._recover_mimo_window()          # 挂件窗口单独丢失时兜底重建
             self.ensure_parent()
             if self.hwnd and win32gui.IsWindow(self.hwnd):
                 z = (win32con.HWND_TOP if self._child_of_taskbar
                      else win32con.HWND_TOPMOST)
                 win32gui.SetWindowPos(self.hwnd, z, 0, 0, 0, 0,
+                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
+                                      win32con.SWP_NOACTIVATE)
+            if self.mimo_hwnd and win32gui.IsWindow(self.mimo_hwnd):
+                z = (win32con.HWND_TOP
+                     if self._is_mounted_on_taskbar(self.mimo_hwnd)
+                     else win32con.HWND_TOPMOST)
+                win32gui.SetWindowPos(self.mimo_hwnd, z, 0, 0, 0, 0,
                                       win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
                                       win32con.SWP_NOACTIVATE)
 
@@ -608,6 +757,14 @@ class App:
             self._cur_rect = self._target_rect
             self._apply_rect()
         self.set_visible(want_show)
+
+        # MiMo 挂件:与播放状态无关,只受几何/全屏开关控制
+        mimo_show = (self._mimo_target is not None
+                     and not (hide_fullscreen and self._fs_state))
+        self._set_mimo_visible(mimo_show)
+        if mimo_show:
+            self._draw_mimo()
+
         if not want_show:
             return
         self._animate_rect(dt)
@@ -651,6 +808,17 @@ class App:
         if frame is not None:
             self.layered.update(frame)
 
+    def _draw_mimo(self) -> None:
+        w = self.mimo_worker
+        if w is None or self.mimo_layered is None:
+            return
+        if w.version == self._mimo_drawn:
+            return                                  # 内容没变,不重画
+        frame = self.mimo_renderer.draw(w.state, w.data, w.message)
+        if frame is not None:
+            self.mimo_layered.update(frame)
+            self._mimo_drawn = w.version
+
     @staticmethod
     def _title_text(media) -> str:
         t, a = media.display_title, media.display_artist
@@ -667,14 +835,46 @@ class App:
     def toggle_autostart(self) -> None:
         set_autostart(not get_autostart())
 
+    def mimo_login(self) -> None:
+        """托盘菜单:打开浏览器让用户登录小米账号(挂件会话初始化/重登)。"""
+        worker = self._ensure_mimo_worker()
+        if worker:
+            worker.request_login()
+
+    def _ensure_mimo_worker(self):
+        """启动(或热启用后补建)MiMo 取数线程。"""
+        if not self.cfg.get("mimo_widget", True):
+            return self.mimo_worker
+        if self.mimo_worker is None:
+            self.mimo_worker = MimoWorker(
+                self._mimo_notify,
+                refresh_sec=float(self.cfg.get("mimo_refresh_sec", 180)))
+            self.mimo_worker.start()
+        return self.mimo_worker
+
+    def _mimo_notify(self) -> None:
+        """MimoWorker 回调(任意线程)→ 唤醒 UI 线程刷新。"""
+        try:
+            if self.hwnd and win32gui.IsWindow(self.hwnd):
+                win32gui.PostMessage(self.hwnd, WM_APP_MIMO, 0, 0)
+        except Exception:
+            pass
+
     def quit(self) -> None:
         self.quit_requested = True          # 豁免 WM_CLOSE 拦截,允许真正销毁
         if self.tray:
             self.tray.remove()
+        if self.mimo_worker:
+            self.mimo_worker.stop()
         try:
             win32gui.DestroyWindow(self.hwnd)
         except Exception:
             pass
+        if self.mimo_hwnd:
+            try:
+                win32gui.DestroyWindow(self.mimo_hwnd)
+            except Exception:
+                pass
         try:
             win32gui.DestroyWindow(self.tray_hwnd)
         except Exception:
@@ -695,17 +895,21 @@ class App:
         self._create_tray_host()
         if not self.no_tray:
             self.tray = TrayIcon(self.tray_hwnd, self.toggle_display,
-                                 self.toggle_autostart, self.quit)
+                                 self.toggle_autostart, self.quit,
+                                 on_mimo=self.mimo_login)
         self._create_main_window()
+        self._create_mimo_window()
 
         self.geom = taskbar_geometry.get_geometry(
             self.cfg.get("min_gap_width", 150.0))
 
         self._adopt_taskbar_parent()
+        self._adopt_taskbar_parent(self.mimo_hwnd)
         self.on_geometry()
 
         self.lyrics_worker = LyricsWorker(self.lyrics_client, self.hwnd)
         self.lyrics_worker.start()
+        self._ensure_mimo_worker()
         self.watcher.start()
         if not self.demo:
             taskbar_geometry.GeometryPoller(
@@ -734,6 +938,8 @@ class App:
 
     def _config_changed(self) -> None:
         self.renderer.invalidate()
+        self.mimo_renderer.invalidate()
+        self._ensure_mimo_worker()      # 运行中打开 mimo_widget 也能生效
         self._req_key = None
 
 

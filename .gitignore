@@ -6,3 +6,6 @@ config.json
 _smtc_stream.ps1
 tools/_qrc_sample.b64
 .zcodeignore
+.mimo_profile/
+mimo_session.json
+_test_*.png

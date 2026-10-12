@@ -7,3 +7,5 @@ winrt-runtime>=3.2
 winrt-Windows.Foundation>=3.2
 winrt-Windows.Foundation.Collections>=3.2
 winrt-Windows.Media.Control>=3.2
+# MiMo 余额挂件:首次登录/SSO续期用(全新机器需 playwright install chromium)
+playwright>=1.59

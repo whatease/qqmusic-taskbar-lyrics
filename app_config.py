@@ -37,6 +37,10 @@ DEFAULTS = {
     "lyric_lead_sec": 0.5,          # 歌词比歌声提前多少秒出现(0=同步;跟唱建议0.3~0.8)
     "lyric_retry_sec": 120,         # 歌词获取失败后的重试间隔
     "try_qrc": False,               # 逐字歌词(QRC匿名接口已失效,保留开关)
+    # ── MiMo 余额挂件(任务栏右侧,紧靠托盘) ─────────────
+    "mimo_widget": True,            # 显示 MiMo 余额/今日用量挂件
+    "mimo_width": 160,              # 挂件宽度(逻辑像素,空间不足时自动收窄)
+    "mimo_refresh_sec": 180,        # 余额/用量刷新间隔
     "debug": False,
 }
 

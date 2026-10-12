@@ -9,7 +9,8 @@
 - 全屏应用/游戏时自动隐藏;暂停时定格当前进度
 - 歌词比歌声**提前约0.5秒**出现,方便跟唱(`lyric_lead_sec` 可调)
 - 歌词与歌曲来源:系统 SMTC(媒体传输控制)+ QQ音乐公开接口(自动搜索匹配,本地缓存)
-- 托盘图标:右键菜单(显示/隐藏、开机自启、退出);`config.json` 支持热修改
+- **MiMo 余额挂件**:任务栏右侧(紧靠托盘)常显小米 MiMo 账户余额、今日 Token 与消费(`mimo_widget` 开关)
+- 托盘图标:右键菜单(显示/隐藏、开机自启、登录 MiMo、退出);`config.json` 支持热修改
 
 ## 快速开始
 
@@ -33,6 +34,8 @@
 | `taskbar_geometry.py` | UIA 遍历任务栏,计算图标与托盘间的空档 |
 | `karaoke_renderer.py` | Pillow 卡拉OK渲染(双色/辉光/滚动) |
 | `layered_window.py` | 分层窗口公共设施(UpdateLayeredWindow) |
+| `mimo_client.py` | MiMo 控制台取数(纯HTTP + SSO 续期 + 一次性登录) |
+| `mimo_widget.py` | MiMo 余额/今日用量挂件渲染 |
 | `app_config.py` | 配置加载/热重载 |
 | `config.json` | 首次运行自动生成,可手动修改(保存即生效) |
 | `tools/diagnose.py` | 诊断:环境/几何/媒体/歌词 一键排查 |
@@ -54,11 +57,15 @@
 | `lyric_lead_sec` | 0.5 | 歌词比歌声提前出现的秒数(0=同步;跟唱建议0.3~0.8,保存即生效) |
 | `hide_in_fullscreen` | true | 全屏时隐藏 |
 | `allow_other_media` | true | 无QQ音乐会话时是否用其他播放器 |
+| `mimo_widget` | true | 显示 MiMo 余额挂件(首次使用需托盘登录一次) |
+| `mimo_width` | 160 | 挂件宽度(逻辑像素;空隙不足自动收窄) |
+| `mimo_refresh_sec` | 180 | 余额/用量刷新间隔(秒) |
 
 ## 常见问题
 
 - **没有显示**:任务栏太满(空隙 < `min_gap_width`)会自动隐藏;运行 `python tools/diagnose.py` 查看空隙与媒体会话状态。
 - **歌词不匹配**:程序按"歌名+歌手"搜索QQ音乐接口,冷门歌曲可能匹配失败(会显示标题模式),缓存 10 分钟后自动重试。
+- **挂件显示"MiMo 未登录"**:右键托盘 → "登录 MiMo 账号",在弹出的浏览器里登录一次即可;之后平台会话每 24 小时自动续期,账号会话失效才需要重新登录。
 - **想退出**:右键托盘音符图标 → 退出。
 - **演示模式**:`python taskbar_lyrics.py --demo 晴天 周杰伦`
 
