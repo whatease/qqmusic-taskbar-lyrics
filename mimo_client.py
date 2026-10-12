@@ -126,7 +126,9 @@ def _cookie_header(state: dict) -> tuple[str, str | None]:
         name, value = c.get("name", ""), str(c.get("value", ""))
         parts.append(f"{name}={value}")
         if name == "api-platform_ph":
-            ph = value
+            # cookie 值含"="会被浏览器加双引号包裹存储;查询参数须去引号,
+            # 带引号请求 detail/list 会被服务端判 401(实测)
+            ph = value.strip('"')
     return "; ".join(parts), ph
 
 
@@ -204,12 +206,16 @@ def _pw():
     return sync_playwright()
 
 
-def _has_platform_session(page, timeout_ms: int) -> bool:
-    """轮询等待平台 cookie 就位(SSO 链完成后 set)。"""
+def _has_platform_session(ctx, page, timeout_ms: int) -> bool:
+    """轮询等待平台 cookie 就位(SSO 链完成后 set)。
+
+    用 ctx.cookies() 而非 document.cookie:HttpOnly 的 ph/slh 在
+    JS 里读不到,document.cookie 判断会把成功的续期误判为失败。
+    """
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         try:
-            if page.evaluate("() => document.cookie.includes('api-platform_ph=')"):
+            if any(c.get("name") == "api-platform_ph" for c in ctx.cookies()):
                 return True
         except Exception:
             pass  # 正在跨域跳转
@@ -233,7 +239,7 @@ def renew(timeout_ms: int = 25000) -> bool:
                           f"?currentPath={urllib.parse.quote('/console/balance')}",
                           wait_until="domcontentloaded", timeout=timeout_ms)
                 # 正常链:302 → account.xiaomimimo.com(会话在,静默) → /sts → 控制台
-                ok = _has_platform_session(page, timeout_ms)
+                ok = _has_platform_session(ctx, page, timeout_ms)
                 if ok:
                     _save_state(ctx.storage_state())
                     log.info("MiMo 会话 SSO 续期成功")

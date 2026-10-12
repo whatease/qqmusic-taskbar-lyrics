@@ -782,6 +782,10 @@ class App:
                 self.lyrics_worker.request(key, media.title, media.artist)
             lyrics = self.lyrics_worker.get(key)
         pos = media.current_position()
+        if pos is not None:
+            # 时轴整体微调:正数=歌词与粉字延后出现(听到的声音慢于系统
+            # 进度,如蓝牙耳机延迟),负数=提前;config.json 热重载
+            pos -= float(cfg.get("sync_offset_sec", 0.0))
 
         # 选行与文本(行提前 lead 秒出现,粉色推进仍与真实演唱同步)
         fade = 1.0

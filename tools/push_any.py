@@ -85,7 +85,10 @@ def push_via_api(repo: str) -> None:
     need = [p for p, (_, sha) in local.items() if remote.get(p) != sha]
     print(f"差异文件 {len(need)} 个,上传中 ...", flush=True)
     for p in need:
-        data = (ROOT / p).read_bytes()
+        # 从索引读 blob(与 git add 后的归一化内容一致);直接读工作区
+        # 文件会因 CRLF/LF 混合导致 SHA 对不上
+        data = subprocess.run(["git", "cat-file", "blob", f":{p}"],
+                              cwd=ROOT, capture_output=True).stdout
         blob = json.loads(gh(repo, "POST", "git/blobs",
                              {"content": base64.b64encode(data).decode(),
                               "encoding": "base64"}))["sha"]
