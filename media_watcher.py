@@ -141,6 +141,16 @@ class MediaWatcher(threading.Thread):
 
     def _publish(self, info: MediaInfo | None) -> None:
         with self._lock:
+            # 平滑:同曲播放中位置只应前进。QQ 时间轴小幅回退(<1s,采样
+            # 粒度导致的锯齿)若直接发布,进度会短暂倒退,恰逢行边界就成
+            # 了两句来回闪;小幅回退钳到外推值,大幅回退视为拖进度条照常
+            if (info is not None and self._info is not None
+                    and info.key == self._info.key and info.playing
+                    and self._info.playing):
+                prev = self._info.current_position()
+                if prev is not None and info.position < prev:
+                    if prev - info.position < 1.0:
+                        info.position = prev
             self._info = info
             self._version += 1
 
@@ -199,10 +209,16 @@ class MediaWatcher(threading.Thread):
             rate = 1.0
         pos = tl.position.total_seconds() if tl.position else 0.0
         try:
-            lu = tl.last_updated_time  # naive 本地 datetime(pywinrt 3.x 投影)
+            lu = tl.last_updated_time
             if lu:
+                # pywinrt 返回 UTC 带时区 datetime,须先转本地 naive,
+                # 否则 datetime.now()-lu 抛 TypeError,外推被静默吞掉 →
+                # 进度只剩滞后的 tl.position,采样成锯齿回跳,歌词行在
+                # 边界附近来回乱闪
+                if lu.tzinfo is not None:
+                    lu = lu.astimezone().replace(tzinfo=None)
                 elapsed = (datetime.now() - lu).total_seconds()
-                if playing and elapsed > 0:
+                if playing and 0 < elapsed <= 300:
                     pos += elapsed * rate
         except Exception:
             pass
