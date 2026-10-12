@@ -114,9 +114,23 @@ class TrayIcon:
         self.hwnd = hwnd
         self.on_toggle, self.on_autostart, self.on_quit = on_toggle, on_autostart, on_quit
         self.hicon = _pil_to_hicon(_make_tray_icon_image(32))
-        win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, (
-            hwnd, 0, win32gui.NIF_MESSAGE | win32gui.NIF_ICON | win32gui.NIF_TIP,
-            WM_APP_TRAY, self.hicon, APP_NAME))
+        self.added = False
+        self.add()                     # 失败不抛异常:开机时任务栏可能未就绪
+
+    def add(self) -> bool:
+        """注册托盘图标;失败(如开机时 explorer 未就绪)返回 False,由心跳重试。"""
+        if self.added:
+            return True
+        args = (self.hwnd, 0,
+                win32gui.NIF_MESSAGE | win32gui.NIF_ICON | win32gui.NIF_TIP,
+                WM_APP_TRAY, self.hicon, APP_NAME)
+        try:
+            win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, args)
+            self.added = True
+            return True
+        except Exception as exc:
+            log.warning("托盘图标注册失败(将自动重试): %s", exc)
+            return False
 
     def show_menu(self) -> None:
         menu = win32gui.CreatePopupMenu()
@@ -149,19 +163,13 @@ class TrayIcon:
 
     def readd(self) -> None:
         """explorer 重启后托盘图标随旧任务栏一起消失,需重新注册。"""
-        args = (self.hwnd, 0,
-                win32gui.NIF_MESSAGE | win32gui.NIF_ICON | win32gui.NIF_TIP,
-                WM_APP_TRAY, self.hicon, APP_NAME)
         try:
-            win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, args)
+            win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (self.hwnd, 0))
         except Exception:
-            try:
-                win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (self.hwnd, 0))
-                win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, args)
-            except Exception as exc:
-                log.warning("托盘图标重新注册失败: %s", exc)
-                return
-        log.info("托盘图标已重新注册")
+            pass
+        self.added = False
+        if self.add():
+            log.info("托盘图标已重新注册")
 
 
 def get_autostart() -> bool:
@@ -498,15 +506,6 @@ class App:
         else:
             self._geo_cand, self._geo_cand_n = rect, 1
 
-        # 顶部保持(周期性;子窗口模式提为兄弟之首,浮层模式重申置顶)
-        if now - self._last_topmost > 2.0:
-            self._last_topmost = now
-            self.ensure_parent()            # explorer重启兜底:挂载失效即重挂
-            z = win32con.HWND_TOP if self._child_of_taskbar else win32con.HWND_TOPMOST
-            win32gui.SetWindowPos(self.hwnd, z, 0, 0, 0, 0,
-                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
-                                  win32con.SWP_NOACTIVATE)
-
     def _apply_rect(self) -> None:
         x, y, w, h = self._cur_rect
         mounted = self._is_mounted_on_taskbar()
@@ -548,6 +547,21 @@ class App:
         now = time.monotonic()
         dt = min(0.15, now - self._last_frame_t) if self._last_frame_t else 0.033
         self._last_frame_t = now
+
+        # 周期维护(每2秒,与几何状态无关):托盘图标重注册(开机时任务栏可能
+        # 未就绪)、任务栏重挂载(explorer重启兜底)、置顶保持
+        if now - self._last_topmost > 2.0:
+            self._last_topmost = now
+            if self.tray and not self.tray.added:
+                self.tray.add()
+            self.ensure_parent()
+            if self.hwnd and win32gui.IsWindow(self.hwnd):
+                z = (win32con.HWND_TOP if self._child_of_taskbar
+                     else win32con.HWND_TOPMOST)
+                win32gui.SetWindowPos(self.hwnd, z, 0, 0, 0, 0,
+                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
+                                      win32con.SWP_NOACTIVATE)
+
         media = self.demo.latest() if self.demo else self.watcher.latest()
         if media is None and not self.demo:
             media = media_watcher.find_qqmusic_window_title()
@@ -749,7 +763,6 @@ def setup_logging(debug: bool) -> None:
 
 
 def main() -> int:
-    global NO_TRAY
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--demo", nargs="?", const="晴天 周杰伦", default=None,
                         help="演示模式,例如: --demo 晴天 周杰伦")
@@ -761,8 +774,17 @@ def main() -> int:
     taskbar_geometry.set_dpi_awareness()
     setup_logging(args.debug or bool(args.demo))
 
+    try:
+        return _run_app(args)
+    except Exception:
+        # pythonw 无控制台,异常必须落盘,否则开机自启静默消失无从排查
+        log.exception("程序异常退出")
+        return 1
+
+
+def _run_app(args) -> int:
     # 单实例
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
     if ctypes.windll.kernel32.GetLastError() == 183:
         log.info("已有实例在运行,退出")
         return 0
