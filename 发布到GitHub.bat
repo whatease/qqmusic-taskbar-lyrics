@@ -1,5 +1,5 @@
 @echo off
-rem 一键发布到 GitHub(需先完成 gh 登录,脚本会引导)
+rem 推送更新到 GitHub(git 不通时自动改走 API)
 cd /d "%~dp0"
-python tools\publish_github.py %*
+python tools\push_any.py
 pause
