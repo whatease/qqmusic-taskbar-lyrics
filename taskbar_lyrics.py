@@ -215,11 +215,18 @@ class LyricsWorker(threading.Thread):
         self._pending: str | None = None
         self.result_key: str | None = None
         self.result_lyrics = None
+        self.result_time = 0.0
 
     def request(self, key: str, title: str, artist: str) -> None:
         with self._lock:
-            if self._pending == key or self.result_key == key:
+            if self._pending == key:
                 return
+            if self.result_key == key:
+                if self.result_lyrics is not None:
+                    return
+                # 拉取失败的结果60s后允许重试 —— 一次限流抖动不该让整首歌无歌词
+                if time.monotonic() - self.result_time < 60:
+                    return
             self._pending = key
         self._queue.append((key, title, artist))
 
@@ -236,6 +243,7 @@ class LyricsWorker(threading.Thread):
             lyrics = self.client.fetch(key, title, artist)
             with self._lock:
                 self.result_key, self.result_lyrics = key, lyrics
+                self.result_time = time.monotonic()
                 self._pending = None
             try:
                 win32gui.PostMessage(self.notify_hwnd, WM_APP_LYRICS, 0, 0)
@@ -606,16 +614,15 @@ class App:
         if media is None:
             return          # 宽限期内保留当前画面,不重绘
 
-        # 歌词请求
+        # 歌词请求:每帧都交给 worker 去重(失败结果60s后自动重试),
+        # 不再用 _req_key 一次性挡板 —— 否则一次失败整首歌都没歌词
         key = media.key
         lyrics = None
         if self.demo:
             lyrics = self.demo.lyrics
         else:
-            if key != getattr(self, "_req_key", None):
-                self._req_key = key
-                if self.lyrics_worker:
-                    self.lyrics_worker.request(key, media.title, media.artist)
+            if self.lyrics_worker:
+                self.lyrics_worker.request(key, media.title, media.artist)
             lyrics = self.lyrics_worker.get(key)
         pos = media.current_position()
 

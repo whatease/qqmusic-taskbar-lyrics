@@ -38,6 +38,10 @@ _META_TAG = re.compile(r"^\[(ti|ar|al|by|offset|kana|hash|total|ve|re):(.*)\]$",
 NEG_TTL = 600  # 负缓存(搜不到)有效期,秒
 
 
+class TransientError(Exception):
+    """网络瞬时失败(超时/限流/空响应)——不写负缓存,下一首/下次再试。"""
+
+
 def _http_get(url: str, timeout: float = 6.0) -> str:
     req = urllib.request.Request(
         url, headers={"User-Agent": UA, "Referer": REFERER})
@@ -184,7 +188,12 @@ class LyricsClient:
                 return None
             if cached is not None:
                 return cached
-            lyrics = self._fetch_online(key, title, artist)
+            try:
+                lyrics = self._fetch_online(key, title, artist)
+            except TransientError as exc:
+                # 瞬时失败不写负缓存 —— 否则限流一次就10分钟无歌词
+                log.warning("搜索瞬时失败(不入负缓存): %s", exc)
+                return None
             self._save_cache(key, lyrics)
             return lyrics
 
@@ -213,20 +222,28 @@ class LyricsClient:
                            "method": "DoSearchForQQMusicDesktop",
                            "param": {"search_type": 0, "query": query,
                                      "page_num": 1, "num_per_page": 8}}}
-        try:
-            body = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                _SEARCH_URL, data=body,
-                headers={"User-Agent": UA, "Referer": REFERER,
-                         "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-            songs = data["req"]["data"]["body"]["song"]["list"]
-        except Exception as exc:
-            log.warning("搜索失败 %s: %s", query, exc)
-            return None
+        songs = None
+        last_err: Exception | None = None
+        for attempt in range(3):        # 空响应/超时常为限流抖动,重试
+            try:
+                body = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    _SEARCH_URL, data=body,
+                    headers={"User-Agent": UA, "Referer": REFERER,
+                             "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                songs = data["req"]["data"]["body"]["song"]["list"]
+            except Exception as exc:
+                last_err = exc
+                songs = None
+            if songs:
+                break
+            time.sleep(0.8 * (attempt + 1))
         if not songs:
-            return None
+            if last_err is not None:
+                raise TransientError(f"搜索异常: {last_err}") from last_err
+            return None          # 接口正常但确实无结果 → 走负缓存
 
         nt, na = _normalize(title), _normalize(artist)
         best, best_score = None, 0.0
