@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+logs/
+lyrics_cache/
+config.json
+_smtc_stream.ps1
+tools/_qrc_sample.b64
+.zcodeignore
